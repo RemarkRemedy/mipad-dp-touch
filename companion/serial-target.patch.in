@@ -1,0 +1,309 @@
+--- a/pad-display-mac/Info.plist
++++ b/pad-display-mac/Info.plist
+@@ -6,8 +6,8 @@
+  <key>CFBundleDisplayName</key><string>Pad Display</string>
+  <key>CFBundleExecutable</key><string>PadDisplay</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+- <key>CFBundleShortVersionString</key><string>0.4.6</string>
+- <key>CFBundleVersion</key><string>10</string>
++ <key>CFBundleShortVersionString</key><string>0.4.7</string>
++ <key>CFBundleVersion</key><string>11</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+ </dict></plist>
+--- a/pad-display-mac/PadDisplay.swift
++++ b/pad-display-mac/PadDisplay.swift
+@@ -35,6 +35,8 @@
+     private var expectedMac = true
+ 
+     func applicationDidFinishLaunching(_ notification: Notification) {
++        DistributedNotificationCenter.default().addObserver(self, selector: #selector(companionRequest(_:)),
++            name: Notification.Name("dev.tj.paddisplay.request"), object: nil, suspensionBehavior: .deliverImmediately)
+         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+         statusItem.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Pad Display")
+         statusItem.button?.toolTip = "Pad Display"
+@@ -253,7 +255,7 @@
+         guard !running else { return }
+         wakePolicy.disarm()
+         let areas = WindowMover.areas()
+-        guard let source = areas.first(where: { $0.tablet }) else { run("android"); return }
++        guard hasSelectedDisplay, areas.filter({ $0.tablet }).count == 1, let source = areas.first(where: { $0.tablet }) else { run("android"); return }
+         guard let target = WindowMover.target(in: areas, mainID: CGMainDisplayID()) else {
+             showError("No other Mac display is available. Open the MacBook lid or connect another display before switching to Android.")
+             return
+@@ -273,6 +275,51 @@
+     }
+     @objc private func refreshStatus() { run("status") }
+     @objc private func fixMicrophone() { run("fix-microphone") }
++
++    private static let dataFolder = FileManager.default.homeDirectoryForCurrentUser
++        .appendingPathComponent("Library/Application Support/Pad Display")
++
++    @objc private func companionRequest(_ notification: Notification) {
++        guard !running, let token = notification.object as? String, UUID(uuidString: token) != nil else { return }
++        let req = Self.dataFolder.appendingPathComponent("requests").appendingPathComponent(token)
++        guard let data = try? Data(contentsOf: req),
++              let fields = try? JSONDecoder().decode([String: String].self, from: data),
++              let serial = fields["serial"], serial.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) != nil,
++              let action = fields["action"] else { return }
++        do {
++            let selection = Self.dataFolder.appendingPathComponent("selected-serial")
++            if action == "select" {
++                if (try? String(contentsOf: selection, encoding: .utf8)) != serial {
++                    try serial.write(to: selection, atomically: true, encoding: .utf8)
++                    wakePolicy.disarm()
++                    expectedMac = false
++                    autoBrightness = nil
++                    hasSelectedDisplay = false
++                    refreshStatus()
++                }
++            } else {
++                guard (try? String(contentsOf: selection, encoding: .utf8)) == serial else {
++                    throw NSError(domain: "Pad Display", code: 1, userInfo: [NSLocalizedDescriptionKey: "Select this tablet before using its controls."])
++                }
++                switch action {
++                case "android": useAndroid()
++                case "display": showMac()
++                case "brightness-auto", "brightness-manual": run(action)
++                case "fix-microphone": fixMicrophone()
++                case "open-panel": panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
++                case "toggle-audio": toggleAudio()
++                case "toggle-wake": toggleWake()
++                default: return
++                }
++            }
++            try "OK".write(to: req.appendingPathExtension("reply"), atomically: true, encoding: .utf8)
++        } catch {
++            try? error.localizedDescription.write(to: req.appendingPathExtension("reply"), atomically: true, encoding: .utf8)
++        }
++        try? FileManager.default.removeItem(at: req)
++    }
++
++    private var hasSelectedDisplay = false
+ 
+     private func showError(_ message: String) {
+         NSApp.activate(ignoringOtherApps: true)
+@@ -349,7 +396,9 @@
+                 if ok && command == "android" { self.expectedMac = false }
+                 if ok && command == "display" { self.expectedMac = true }
+                 if snapshot["android"] as? Bool == true { self.expectedMac = false }
+-                let tablet = WindowMover.areas().first(where: { $0.tablet })
++                let tablets = WindowMover.areas().filter { $0.tablet }
++                let tablet = tablets.count == 1 ? tablets.first : nil
++                self.hasSelectedDisplay = ok && snapshot["video"] as? Bool == true && tablet != nil
+                 if ok && snapshot["video"] as? Bool == true && snapshot["android"] as? Bool == false,
+                     tablet == nil {
+                     ok = false
+--- a/pad-display-mac/WindowMover.swift
++++ b/pad-display-mac/WindowMover.swift
+@@ -14,10 +14,17 @@
+     // Accessed only by the app's single in-flight connection operation.
+     private static var saved: [SavedWindow] = []
+     private static var loaded = false
+-    private static let journal = WindowJournal(url: FileManager.default.homeDirectoryForCurrentUser
+-        .appendingPathComponent("Library/Application Support/Pad Display/windows.json"))
++    private static let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Pad Display")
++    private static var journal = WindowJournal(url: folder.appendingPathComponent("windows.json"))
++    private static var journalSerial: String?
+ 
+     private static func load() throws {
++        let serial = try String(contentsOf: folder.appendingPathComponent("selected-serial"), encoding: .utf8)
++        if serial != journalSerial {
++            journal = WindowJournal(url: folder.appendingPathComponent("windows-" + serial + ".json"))
++            journalSerial = serial
++            loaded = false
++        }
+         if !loaded { saved = try journal.load(); loaded = true }
+     }
+ 
+--- a/pad-display-mac/local-install.py
++++ b/pad-display-mac/local-install.py
+@@ -83,7 +83,7 @@
+     resources.mkdir(parents=True)
+     binary.parent.mkdir()
+     shutil.copy2(ROOT / 'Info.plist', APP / 'Contents/Info.plist')
+-    for name in ('recover.py', 'recover-usbc.sh', 'control.py', 'bridge.py'):
++    for name in ('pad_target.py', 'recover.py', 'recover-usbc.sh', 'control.py', 'bridge.py'):
+         shutil.copy2(ROOT.parent / 'pad9-dpin-switch-probe' / name, resources / name)
+     shutil.copy2(ROOT / 'vector_status.py', resources / 'vector_status.py')
+     icons = BUILD / 'AppIcon.iconset'
+--- a/pad-display-mac/vector_status.py
++++ b/pad-display-mac/vector_status.py
+@@ -139,7 +139,8 @@
+ 
+     folder = Path.home() / 'Library/Application Support/Pad Display'
+     folder.mkdir(parents=True, exist_ok=True)
+-    marker = folder / 'vector-boot.json'
++    from recover import SERIAL
++    marker = folder / f'vector-boot-{SERIAL}.json'
+     try:
+         record = json.loads(marker.read_text())
+     except (OSError, ValueError):
+--- a/pad9-brightness/brightness.py
++++ b/pad9-brightness/brightness.py
+@@ -10,7 +10,8 @@
+ import subprocess
+ import sys
+ 
+-SERIAL = '@LEGACY_SERIAL@'
++from pad_target import selected
++SERIAL = selected()
+ ADB = '/opt/homebrew/bin/adb'
+ 
+ 
+--- a/pad9-dpin-audio/relay.py
++++ b/pad9-dpin-audio/relay.py
+@@ -10,7 +10,7 @@
+ import time
+ 
+ ROOT = Path(__file__).resolve().parent
+-SERIAL = '@LEGACY_SERIAL@'
++from pad_target import selected
+ PORT = '38681'
+ AUDIO = str(ROOT / 'out/mac-audio')
+ parser = argparse.ArgumentParser()
+@@ -46,6 +46,7 @@
+ 
+ 
+ def find_adb():
++    SERIAL = selected()
+     for port in ('5037', '5038'):
+         command = ['/opt/homebrew/bin/adb', '-P', port]
+         try:
+@@ -155,7 +156,7 @@
+                 except subprocess.TimeoutExpired:
+                     if args.auto:
+                         now = time.time()
+-                        if preset() != active_preset or route() != active_route or paused.exists() or now - last_check > 8 or not dpin_active(adb):
++                        if selected() != adb[-1] or preset() != active_preset or route() != active_route or paused.exists() or now - last_check > 8 or not dpin_active(adb):
+                             child.terminate()
+                         last_check = time.time()
+         finally:
+--- a/pad9-dpin-switch-probe/control.py
++++ b/pad9-dpin-switch-probe/control.py
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env python3
+ """Run one temporary DP switching probe command on the connected Pad 9."""
++from pad_target import selected
++SERIAL = selected()
+ import argparse
+ import subprocess
+ 
+@@ -9,8 +11,8 @@
+ for port in ('5037', '5038'):
+     adb = ['/opt/homebrew/bin/adb', '-P', port]
+     devices = subprocess.check_output(adb + ['devices'], text=True, timeout=5)
+-    if '@LEGACY_SERIAL@\tdevice' in devices:
+-        result = subprocess.run(adb + ['-s', '@LEGACY_SERIAL@', 'shell', 'am', 'broadcast',
++    if (SERIAL + '\tdevice') in devices:
++        result = subprocess.run(adb + ['-s', SERIAL, 'shell', 'am', 'broadcast',
+             '-a', 'dev.tj.dpinswitchprobe.CONTROL', '-p', 'com.milink.service',
+             '--es', 'command', args.command], timeout=15, capture_output=True, text=True)
+         print(result.stdout.strip())
+--- a/pad9-dpin-switch-probe/recover.py
++++ b/pad9-dpin-switch-probe/recover.py
+@@ -5,7 +5,10 @@
+ import time
+ 
+ ADB = '/opt/homebrew/bin/adb'
+-SERIAL = '@LEGACY_SERIAL@'
++import os
++from pad_target import selected
++SERIAL = selected()
++os.environ['PAD_DISPLAY_SERIAL'] = SERIAL
+ ROOT = Path(__file__).resolve().parent
+ 
+ 
+--- a/pad9-mic/control.py
++++ b/pad9-mic/control.py
+@@ -33,7 +33,7 @@
+ 
+ 
+ def repair():
+-    port = connected()
++    port = connected(SERIAL)
+     if port is None:
+         raise RuntimeError('Connect the Pad 9 with USB debugging and choose Show Mac display first.')
+     adb = ['/opt/homebrew/bin/adb', '-P', port, '-s', SERIAL, 'shell']
+--- a/pad9-mic/start.py
++++ b/pad9-mic/start.py
+@@ -13,7 +13,8 @@
+ import time
+ 
+ ROOT = Path(__file__).resolve().parent
+-SERIAL = '@LEGACY_SERIAL@'
++from pad_target import selected
++SERIAL = selected()
+ FFMPEG = '/opt/homebrew/bin/ffmpeg'
+ SERVER = '/opt/homebrew/Cellar/scrcpy/5.0.1/share/scrcpy/scrcpy-server'
+ INPUT = str(ROOT / 'audio-input')
+--- a/pad9-mic/watch.py
++++ b/pad9-mic/watch.py
+@@ -8,6 +8,7 @@
+ import subprocess
+ import time
+ 
++from pad_target import selected
+ from start import restore_input
+ 
+ ROOT = Path(__file__).resolve().parent
+@@ -16,12 +17,13 @@
+ LOGS = Path.home() / 'Library/Logs/Pad9Microphone'
+ 
+ 
+-def connected():
++def connected(serial=None):
++    serial = serial or selected()
+     try:
+         if subprocess.run([INPUT, 'dpin'], timeout=3).returncode:
+             return None
+         for port in ('5037', '5038'):
+-            adb = ['/opt/homebrew/bin/adb', '-P', port, '-s', '@LEGACY_SERIAL@']
++            adb = ['/opt/homebrew/bin/adb', '-P', port, '-s', serial]
+             try:
+                 path = subprocess.check_output(adb + ['get-devpath'], stderr=subprocess.DEVNULL,
+                                                text=True, timeout=3).strip()
+@@ -44,9 +46,10 @@
+         self.child = None
+         self.log = None
+ 
+-    def start(self, port):
++    def start(self, port, serial):
+         self.log = (LOGS / 'bridge.log').open('a')
+         environment = os.environ.copy()
++        environment['PAD_DISPLAY_SERIAL'] = serial
+         environment['ADB_SERVER_SOCKET'] = 'tcp:127.0.0.1:' + port
+         self.child = subprocess.Popen([str(ROOT / 'start.py')], stdout=self.log,
+                                       stderr=subprocess.STDOUT, env=environment, start_new_session=True)
+@@ -104,6 +107,7 @@
+ 
+     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+         signal.signal(sig, stop)
++    active_serial = None
+     sleeping, was_connected, retry_at = False, False, 0
+     last_check = time.time()
+     pending_power = '' 
+@@ -129,7 +133,13 @@
+                 bridge.stop()
+                 retry_at = 0
+             last_check = time.time()
+-            port = connected() if not sleeping else None
++            serial = selected()
++            if serial != active_serial:
++                bridge.stop()
++                active_serial = serial
++                was_connected = False
++                retry_at = 0
++            port = connected(serial) if not sleeping else None
+             available = port is not None
+             if not available:
+                 bridge.stop()
+@@ -149,7 +159,7 @@
+                 bridge.stop()
+                 retry_at = time.monotonic() + 3
+             if bridge.child is None and time.monotonic() >= retry_at:
+-                bridge.start(port)
++                bridge.start(port, serial)
+     finally:
+         bridge.stop()
+         power.terminate()

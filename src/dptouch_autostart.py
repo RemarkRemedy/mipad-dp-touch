@@ -21,7 +21,7 @@ import plistlib
 import subprocess
 import sys
 
-LABEL = "io.github.inyvn.xiaomi-dptouch"   # 保持与 CFBundleIdentifier 一致: 改 bundle id 会让 TCC 授权失效
+LABEL = "dev.tj.mipad-dp-touch"   # 保持与 CFBundleIdentifier 一致: 改 bundle id 会让 TCC 授权失效
 APP_NAME = "Mipad DP Touch"
 
 # SMAppService.status()

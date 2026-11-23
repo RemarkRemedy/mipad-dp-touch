@@ -26,6 +26,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 
@@ -52,6 +53,7 @@ import dptouch_wake as WAKE
 import dptouch_unlock as UNLOCK
 import dptouch_window as UI
 import hid_bridge as HB
+import pad_display as PAD
 
 APP_NAME = "Mipad DP Touch"
 APP_VERSION = "2.2.5"          # 发版时改这里 + build_app.sh 的 VER (两处要一致)
@@ -70,6 +72,7 @@ LEGACY_CFG_PATH = os.path.expanduser("~/Library/Application Support/XiaomiDPTouc
 LEGACY_LOG_PATH = os.path.expanduser("~/Library/Logs/XiaomiDPTouch.log")
 
 DEFAULTS = {
+    "pad_serial": "",
     "natural": "system",
     "gain": 1.0,
     # 手势 -> 动作 的按键绑定。默认 = 本工具一直以来的行为, 窗口里的「恢复默认」
@@ -383,6 +386,12 @@ class DPApp(NSObject):
         if self is None:
             return None
         self.cfg = load_cfg()
+        self._pad_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pad-display")
+        self._pad_scan = None
+        self._pad_scan_due = 0.0
+        self._pad_serials = ()
+        self._pad_ready = ""
+        self._pad_job = None
         self.engine = E.Engine(log=log)
         # ★整份配置都要推过去。老写法只推 5 个键, 于是「长按时间 / 长按不动」
         #   这些每次启动都被引擎自己的默认值悄悄盖掉: 设置窗口里显示 0.6 秒, 背后实际跑 0.8 秒。
@@ -1642,6 +1651,22 @@ class DPApp(NSObject):
         m = NSMenu.alloc().init()
         m.setAutoenablesItems_(False)
         self.mi_status = self._mk(m, "正在启动…")
+        self.pad_menu = self._sub(m, "Pad Display").submenu()
+        self.pad_picker = self._sub(self.pad_menu, "Select Pad by serial").submenu()
+        self.pad_status = self._mk(self.pad_menu, "Select a connected Pad")
+        self.pad_actions = []
+        for name, label in (("display", "Show Mac display"), ("android", "Use Android"),
+                            ("brightness-auto", "Use tablet auto brightness"),
+                            ("brightness-manual", "Use manual brightness"),
+                            ("fix-microphone", "Fix microphone"),
+                            ("toggle-audio", "Toggle keep current audio output"),
+                            ("toggle-wake", "Toggle reconnect after wake"),
+                            ("open-panel", "Open Pad Display controls…")):
+            item = self._mk(self.pad_menu, label, "actPadCommand:")
+            item.setRepresentedObject_(name)
+            item.setEnabled_(False)
+            self.pad_actions.append(item)
+        self._draw_pad_picker()
         self.mi_grant = self._mk(m, "完成授权…", "actOpenWindow:")   # 权限不齐时才露面
         self.mi_enable = self._mk(m, "启用笔桥接", "actToggleEnable:", check=self.enabled)
         # 增强模式 = 连触摸屏接口一起认（手指触控）。默认开: 没解锁的平板只给笔那一路,
@@ -1691,6 +1716,82 @@ class DPApp(NSObject):
         self._reflect()
         self._sync_display(force=True)
         self._sync_target_menu(force=True)
+
+    @objc.python_method
+    def _draw_pad_picker(self):
+        self.pad_picker.removeAllItems()
+        if not self._pad_serials:
+            self._mk(self.pad_picker, "No connected Pads")
+        for serial in self._pad_serials:
+            item = self._mk(self.pad_picker, serial, "actSelectPad:",
+                            check=serial == self.cfg["pad_serial"])
+            item.setRepresentedObject_(serial)
+
+    @objc.python_method
+    def _start_pad_job(self, serial, command):
+        if self._pad_job:
+            return
+        fn = PAD.select if command == "select" else PAD.action
+        args = (serial,) if command == "select" else (serial, command)
+        self._pad_job = (serial, command, self._pad_worker.submit(fn, *args))
+        self.pad_status.setTitle_("Working on " + serial + "…")
+        for item in self.pad_actions:
+            item.setEnabled_(False)
+
+    def actSelectPad_(self, sender):
+        self._start_pad_job(str(sender.representedObject()), "select")
+
+    def actPadCommand_(self, sender):
+        if self._pad_ready and self._pad_ready == self.cfg["pad_serial"]:
+            self._start_pad_job(self._pad_ready, str(sender.representedObject()))
+
+    @objc.python_method
+    def _tick_pad(self):
+        now = time.monotonic()
+        if self._pad_job:
+            serial, command, future = self._pad_job
+            if not future.done():
+                return
+            self._pad_job = None
+            try:
+                future.result()
+                if command == "select":
+                    if self.cfg["pad_serial"] != serial:
+                        # Stop outside the engine lock: its RunLoop joins the HID worker.
+                        self.engine.stop()
+                        self._apply(pad_serial=serial)
+                        if self.enabled:
+                            self.engine.start()
+                    self._pad_ready = serial
+                    self._draw_pad_picker()
+                    self._sync_display(force=True)
+                self.pad_status.setTitle_(serial + " · Ready")
+            except Exception as error:
+                self.pad_status.setTitle_(str(error))
+                self._pad_scan_due = now + 15
+                log("Pad Display: %s" % error)
+        if self._pad_scan is not None and self._pad_scan.done():
+            try:
+                serials = tuple(sorted(set(self._pad_scan.result())))
+            except Exception as error:
+                serials = ()
+                self.pad_status.setTitle_(str(error))
+            self._pad_scan = None
+            if self._pad_serials != serials:
+                self._pad_serials = serials
+                self._draw_pad_picker()
+            selected = self.cfg["pad_serial"]
+            if selected and selected not in serials:
+                self._pad_ready = ""
+                self.pad_status.setTitle_(selected + " · Disconnected")
+            elif selected and not self._pad_ready:
+                self._start_pad_job(selected, "select")
+        if self._pad_scan is None and self._pad_job is None and now >= self._pad_scan_due:
+            self._pad_scan_due = now + 5
+            self._pad_scan = self._pad_worker.submit(PAD.devices)
+        enabled = bool(self._pad_ready and self._pad_ready in self._pad_serials and not self._pad_job)
+        for item in self.pad_actions:
+            item.setEnabled_(enabled)
 
     @objc.python_method
     def _reflect(self):
@@ -1948,6 +2049,7 @@ class DPApp(NSObject):
 
     @objc.python_method
     def _tick_body(self):
+        self._tick_pad()
         # 笔上「切换屏幕」: 生效那一半在 HID 线程里已经做完了 (笔要立刻能用), 这里补上
         # 主线程这一半 —— 写配置 + 让菜单的勾跟上。菜单一秒内刷新, 勾就跟着走。
         _v = self.engine.take_pending_target()
@@ -1980,6 +2082,13 @@ class DPApp(NSObject):
         self._poll_calibration()
 
     @objc.python_method
+    def _selected_display(self):
+        target, reason, _ = DP.summary()
+        if target and (not self.cfg["pad_serial"] or E.digitizer_serials() != {self.cfg["pad_serial"]}):
+            return None, "No unique Mac display for the selected Pad"
+        return target, reason
+
+    @objc.python_method
     def _sync_display(self, force=False):
         """重建「显示缩放」子菜单 (每 10 秒自动一次, 或点「重新扫描」立即)。
 
@@ -1997,7 +2106,7 @@ class DPApp(NSObject):
                 self.mg_disp.removeItem_(it)
         self.mi_disp = []
         self._disp_opts = []
-        tgt, why, _others = DP.summary()
+        tgt, why = self._selected_display()
         self._disp_tgt = tgt
         self.mi_disp_parent.setTitle_("显示缩放")
         if tgt is None:
@@ -2015,7 +2124,8 @@ class DPApp(NSObject):
                 self.mi_disp.append(self._mk(self.mg_disp, "这块屏没有可选档位"))
         self.mi_disp.append(NSMenuItem.separatorItem())
         it = self._mk(self.mg_disp, "退回切换前的档位", "actDisplayRestore:")
-        if not self.cfg.get("display_saved"):
+        saved = self.cfg.get("display_saved") or {}
+        if not tgt or saved.get("pad_serial") != self.cfg["pad_serial"]:
             it.setEnabled_(False)
         self.mi_disp.append(it)
         self.mi_disp.append(NSMenuItem.separatorItem())
@@ -2183,7 +2293,8 @@ class DPApp(NSObject):
         """记下切换前那档, 让「退回」变成一键来回 (并且绑身份, 插拔后不会张冠李戴)"""
         if not prev:
             return
-        self._apply(display_saved={"vendor": tgt["vendor"], "model": tgt["model"],
+        self._apply(display_saved={"pad_serial": self.cfg["pad_serial"],
+                                   "vendor": tgt["vendor"], "model": tgt["model"],
                                    "name": tgt["name"], "w": prev["w"], "h": prev["h"],
                                    "hz": prev["hz"], "hidpi": prev["hidpi"]})
 
@@ -2207,8 +2318,9 @@ class DPApp(NSObject):
         返回 True = 已经在这一档(或切换成功)。已经在的那档直接返回: 窗口的下拉每次
         重建都会重新选一次, 不能因为这个平白跑一遍显示器配置事务。
         """
-        tgt = self._disp_tgt
-        if tgt is None or not (0 <= i < len(self._disp_opts)):
+        tgt, _ = self._selected_display()
+        if (tgt is None or not self._disp_tgt or tgt["id"] != self._disp_tgt["id"]
+                or not (0 <= i < len(self._disp_opts))):
             return False
         m = self._disp_opts[i]
         panel = DP.panel_native(tgt)
@@ -2228,8 +2340,8 @@ class DPApp(NSObject):
 
     def actDisplayRestore_(self, sender):
         saved = self.cfg.get("display_saved")
-        tgt = self._disp_tgt
-        if not saved or tgt is None:
+        tgt, _ = self._selected_display()
+        if not saved or saved.get("pad_serial") != self.cfg["pad_serial"] or tgt is None:
             return
         if (saved.get("vendor"), saved.get("model")) != (tgt["vendor"], tgt["model"]):
             self._warn("找不到那块屏", "上次改的是「%s」, 现在它不在。插好平板再试。"
@@ -2947,15 +3059,8 @@ class DPApp(NSObject):
 
     @objc.python_method
     def installed_app_path(self):
-        """本程序自己的 .app 路径; 开发态 (直接跑 src/dptouch.py) 返回空串。
-
-        更新只对装好的 App 有意义 —— 开发态没有可替换的 bundle。
-        """
-        try:
-            b = NSBundle.mainBundle().bundlePath()
-        except Exception:
-            b = ""
-        return b if b.endswith(".app") else ""
+        # Upstream DMGs carry a different identity and do not contain Pad Display.
+        return ""
 
     @objc.python_method
     def update_due(self, now=None, last=None):
@@ -2982,7 +3087,7 @@ class DPApp(NSObject):
             return False
         if not self.installed_app_path():
             if manual:
-                self._warn("开发态不检查更新", "更新是给装好的 App 用的。")
+                self._warn("Pad Display local build", "Install updates using this fork’s signed build workflow.")
             return False
         self._upd_busy = "check"
         self._upd_manual = bool(manual)

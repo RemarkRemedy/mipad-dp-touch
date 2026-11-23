@@ -14,6 +14,10 @@
 
 </div>
 
+## Pad Display fork
+
+Use **Pad Display → Select Pad** to choose a tablet by USB serial. See the [companion setup and controls](companion/README.md). This branch is based on v2.2.5.
+
 ## 准备
 
 - 小米平板 9 Pro Max、小米焦点触控笔 Pro，以及支持视频传输的 USB-C 全功能线。

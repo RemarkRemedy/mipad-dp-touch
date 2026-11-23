@@ -11,10 +11,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VENV=.venv
-APP_NAME="Mipad DP Touch"
+APP_NAME="Mipad DP Touch — Pad Display"
 # bundle id 保持稳定 (改名字不改 id): TCC 的输入监控/辅助功能授权是按 id 匹配的,
 # 换了 id 用户就得重新授权一遍。
-BUNDLE_ID="io.github.inyvn.xiaomi-dptouch"
+BUNDLE_ID="dev.tj.mipad-dp-touch"
 VER="2.2.5"
 ICON="AppIcon.icns"
 
@@ -201,29 +201,6 @@ fi
 rm -rf "dist-pyi/$APP_NAME.app"
 mv "$BUILT" "dist-pyi/$APP_NAME.app"
 
-echo "==> ad-hoc 签名"
-# 1) --deep 先把嵌套的 .so/.dylib 签上
-codesign --force --deep --sign - "dist-pyi/$APP_NAME.app"
-
-# 2) 外层再补一条「稳定指定要求」。
-#    ad-hoc 签名的默认指定要求是 cdhash H"..."; 重新打包 cdhash 必变
-#    → 系统里已授权的 TCC 记录对不上（tccd 日志会写
-#      "Failed to match existing code requirement ... kTCCServiceAccessibility")
-#    → App 看起来有权限、实际每次请求都被拒。
-#    改成只认 bundle id 后，授权可跨重新打包保留（一次授权，长期有效）。
-#    注意: 这条要求不能与 --deep 连用 —— --deep 会把它套到嵌套二进制上，
-#    导致 "nested code is modified or invalid"（实测 20 个文件校验失败）。
-BID="$BUNDLE_ID"
-if [ -n "$BID" ]; then
-  codesign --force --sign - -r="designated => identifier \"$BID\"" "dist-pyi/$APP_NAME.app"
-fi
-
+python3 tools/sign_local.py "dist-pyi/$APP_NAME.app"
 codesign --verify --deep --strict "dist-pyi/$APP_NAME.app"
-codesign -dv "dist-pyi/$APP_NAME.app" 2>&1 | grep -E 'Identifier|Signature' || true
-codesign -d -r- "dist-pyi/$APP_NAME.app" 2>&1 | grep -i designated || true
-
-echo
-echo "==> 完成: dist-pyi/$APP_NAME.app"
-du -sh "dist-pyi/$APP_NAME.app"
-echo
-echo "安装:  cp -R \"dist-pyi/$APP_NAME.app\" /Applications/ && open \"/Applications/$APP_NAME.app\""
+echo "Built dist-pyi/$APP_NAME.app"

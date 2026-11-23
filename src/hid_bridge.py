@@ -191,6 +191,8 @@ def make_match(mode="pen"):
             keys = (ctypes.c_void_p * n)(*[cfstr(k) for k, _v in items])
             vals = (ctypes.c_void_p * n)(*[cfnum(v) for _k, v in items])
             dicts.append(cf.CFDictionaryCreate(None, keys, vals, n, CF_KB(), CF_VB()))
+            for ref in (*keys, *vals):
+                cf.CFRelease(ref)
     a = (ctypes.c_void_p * len(dicts))(*dicts)
     arr = cf.CFArrayCreate(None, a, len(dicts), CF_AB())
     for d in dicts:

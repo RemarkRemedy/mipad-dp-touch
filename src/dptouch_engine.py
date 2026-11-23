@@ -245,14 +245,17 @@ def finger_cookie_map(dev):
 
 
 def _dict(pairs):
-    """[(bytes_key, int_val)] -> CFDictionaryRef (调用方负责 CFRelease)"""
+    """Build an IOHID match dictionary with number or UTF-8 string values."""
     n = len(pairs)
     keys = (ctypes.c_void_p * n)()
     vals = (ctypes.c_void_p * n)()
     for i, (k, v) in enumerate(pairs):
         keys[i] = H.cfstr(k)
-        vals[i] = H.cfnum(v)
-    return H.cf.CFDictionaryCreate(None, keys, vals, n, H.CF_KB(), H.CF_VB())
+        vals[i] = H.cfstr(v.encode("utf-8")) if isinstance(v, str) else H.cfnum(v)
+    result = H.cf.CFDictionaryCreate(None, keys, vals, n, H.CF_KB(), H.CF_VB())
+    for ref in (*keys, *vals):
+        H.cf.CFRelease(ref)
+    return result
 
 
 def _cfstr_to_str(ref):
@@ -263,6 +266,28 @@ def _cfstr_to_str(ref):
     if H.cf.CFStringGetCString(ref, buf, 512, KCFSTRING_UTF8):
         return buf.value.decode("utf-8", "replace")
     return ""
+
+
+def digitizer_serials():
+    """Enumerate connected Pad digitizers without opening or seizing them."""
+    H.cf.CFSetGetValues.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    H.cf.CFSetGetValues.restype = None
+    manager = H.iokit.IOHIDManagerCreate(None, 0)
+    match = H.make_match("auto")
+    key = H.cfstr(b"SerialNumber")
+    devices = None
+    try:
+        H.iokit.IOHIDManagerSetDeviceMatchingMultiple(manager, match)
+        devices = H.iokit.IOHIDManagerCopyDevices(manager)
+        if not devices:
+            return set()
+        refs = (ctypes.c_void_p * H.cf.CFSetGetCount(devices))()
+        H.cf.CFSetGetValues(devices, refs)
+        return {_cfstr_to_str(H.iokit.IOHIDDeviceGetProperty(d, key)) for d in refs}
+    finally:
+        for ref in (devices, key, match, manager):
+            if ref:
+                H.cf.CFRelease(ref)
 
 
 PROP_PRODUCT = None
@@ -711,13 +736,17 @@ class Engine(object):
         """
         dicts = []
         mode = self.cfg.get("input_mode", "auto")
+        target = []
+        if "pad_serial" in self.cfg:
+            # No selection must match no tablet, even with two identical units.
+            target = [(b"SerialNumber", self.cfg["pad_serial"] or "<unselected>")]
         if self.cfg["allow_unknown"]:
             for v in SUPPORTED_VENDOR_IDS:
-                dicts.append(_dict([(b"VendorID", v)]))
+                dicts.append(_dict(target + [(b"VendorID", v)]))
         else:
             for v in SUPPORTED_VENDOR_IDS:
                 for usage in (H.match_usages(mode) if usages is None else usages):
-                    dicts.append(_dict([(b"VendorID", v), (b"ProductID", PRODUCT_ID),
+                    dicts.append(_dict(target + [(b"VendorID", v), (b"ProductID", PRODUCT_ID),
                                         (b"PrimaryUsagePage", PEN_USAGE_PAGE),
                                         (b"PrimaryUsage", usage)]))
         arr = (ctypes.c_void_p * len(dicts))(*dicts)
